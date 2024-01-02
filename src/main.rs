@@ -1,165 +1,75 @@
-use std::io::{Result, Read, Write, Error, ErrorKind::InvalidData};
 use std::num::NonZeroU64;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use zune_inflate::DeflateDecoder as GzDecoder;
+use tracing::{warn, info};
 use zopfli::Format::Gzip;
+use clap::Parser;
 
+#[derive(Parser, Debug)]
+struct CompressionArgs {
+    #[arg(help="The initial number of iterations to perform when compressing the data")]
+    #[arg(long="min_iterations", default_value="100")]
+    pub minimum_iterations: u64,
 
-fn main() {
-    let usage = "Usage: nbt-compress [-i <iterations>] file1 file2 ...";
-    let args: Vec<String> = std::env::args().collect();
-    let mut iterations = -1;
-    let mut files = Vec::new();
+    #[arg(help="The final number of iterations to perform when compressing the data")]
+    #[arg(long="max_iterations", default_value="500")]
+    pub maximum_iterations: u64,
 
-    for (index, arg) in args.iter().enumerate() {
-        if arg.starts_with("-i") {
-            iterations = parse_arg(&arg, &args, index).unwrap_or_else(|e| {
-                eprintln!("Error parsing iterations: {}", e);
-                std::process::exit(1);
-            });
-        } else if arg.starts_with("--iterations") {
-            iterations = parse_arg(&arg, &args, index).unwrap_or_else(|e| {
-                eprintln!("Error parsing iterations: {}", e);
-                std::process::exit(1);
-            });
-        } else if arg.eq("-h") || arg.eq("--help") {
-            println!("{}", usage);
-            std::process::exit(0);
-        } else if index > 0 {
-            // Skip the first argument (program name)
-            files.push(arg.clone());
-        }
-    }
+    #[arg(help="How many iterations to increase by each time until the maximum is reached")]
+    #[arg(short, default_value="25")]
+    pub step: u64,
 
-    if files.is_empty() {
-        println!("{}", usage);
-        std::process::exit(1);
-    }
+    #[arg(help="The file to compress")]
+    #[arg(short, long)]
+    pub file: String,
 
-    let mut total_time = Duration::new(0, 0);
-    let mut total_saved_space = 0;
-
-    for file in &files {
-        match compress_file(file, iterations) {
-            Ok((elapsed_time, saved_space)) => {
-                total_time += elapsed_time;
-                total_saved_space += saved_space;
-            }
-            Err(_) => {}
-        }
-    }
-
-    if files.len() > 1 {
-        println!("\nDone!");
-        println!("Total time: {:?}", total_time);
-        println!("Total saved space: {} bytes", total_saved_space);
-    }
+    #[arg(help="The number of times to repeat each number of iterations")]
+    #[arg(short, default_value="1")]
+    pub repetitions: u32
 }
 
-fn compress_file(file: &str, iterations: i32) -> Result<(Duration, usize)> {
-    match read_file(file) {
-        Ok(contents) => {
-            let start_time = Instant::now();
-            let optimized_contents =
-                match optimise_file_contents(contents.clone(), iterations) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Error compressing {}: {}", file, e);
-                        return Err(e);
-                    }
-                };
-            let elapsed_time = start_time.elapsed();
+fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
 
-            if optimized_contents.len() < contents.len() {
-                let saved_space = contents.len() - optimized_contents.len();
-                if let Err(e) = write_file(file, optimized_contents) {
-                    eprintln!("Error writing to {}: {}", file, e);
-                    Err(e)
-                } else {
-                    println!(
-                        "File {} compressed. Saved space: {} bytes. \nCompression time: {:?}",
-                        file, saved_space, elapsed_time
-                    );
-                    Ok((elapsed_time, saved_space))
-                }
-            } else {
-                println!(
-                    "File {} not compressed. No space saved. \nCompression time: {:?}",
-                    file, elapsed_time
-                );
-                return Ok((elapsed_time, 0));
-            }
+    #[cfg(debug_assertions)]
+    warn!("running in debug mode, this may not be representive of realworld performance");
+
+    let args = CompressionArgs::parse();
+
+    let file = std::fs::read(&args.file)?;
+    let mut iterations: u64 = args.minimum_iterations; 
+    
+    while iterations <= args.maximum_iterations {
+        for _ in 0..args.repetitions {
+            compress_data(&file, iterations)?;
         }
-        Err(e) => {
-            eprintln!("Error reading from {}: {}", file, e);
-            Err(e)
-        }
+        iterations += args.step;
     }
-}
 
-fn parse_arg(arg: &str, args: &Vec<String>, index: usize) -> std::result::Result<i32, String> {
-    if arg.starts_with("-i") {
-        args[index][2..].parse().map_err(|e| format!("Failed to parse iterations: {}", e))
-    } else if arg.starts_with("--iterations") {
-        args[index][12..].parse().map_err(|e| format!("Failed to parse iterations: {}", e))
-    } else {
-        Err("Invalid argument for parse_arg".to_string())
-    }
-}
-
-fn read_file(path: &str) -> Result<Vec<u8>> {
-    let mut file = std::fs::File::open(path)?;
-    let mut contents = Vec::new();
-    file.read_to_end(&mut contents)?;
-    Ok(contents)
-}
-
-fn write_file(path: &str, contents: Vec<u8>) -> Result<()> {
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(&contents)?;
     Ok(())
 }
 
-fn optimise_file_contents(input: Vec<u8>, force_iterations: i32) -> Result<Vec<u8>> {
-    let contents = match decompress(input.clone()) {
-        Ok(c) => c,
-        Err(e) => return Err(e)
-    };
-
-    let iter = if force_iterations != -1 {
-        force_iterations
-    } else if contents.len() > 20_000 {
-        100
-    } else {
-        500
-    };
-
-    Ok(compress(contents, iter as u64).unwrap_or_else(|_| input))
-}
-
-fn decompress(stuff: Vec<u8>) -> Result<Vec<u8>> {
-    let idk_why_rust_wants_me_to_do_this = stuff.clone();
-    let mut decoder = GzDecoder::new(&idk_why_rust_wants_me_to_do_this[..]);
-
-    match decoder.decode_gzip() {
-        Ok(result) => Ok(result),
-        Err(_) => Err(Error::new(InvalidData, "Invalid gzip data"))
-    }
-}
-
-fn compress(stuff: Vec<u8>, iter: u64) -> Result<Vec<u8>> {
+fn compress_data(file: &Vec<u8>, iterations: u64) -> anyhow::Result<()> {
     let options = zopfli::Options {
-        iteration_count: NonZeroU64::new(iter).unwrap(),
+        iteration_count: NonZeroU64::new(iterations).unwrap(),
         ..Default::default()
     };
 
-    let mut output = Vec::with_capacity(stuff.len());
-    match zopfli::compress(options, Gzip, &stuff[..], &mut output) {
-        Ok(_) => {
-            output.shrink_to_fit();
-            Ok(output)
-        },
-        Err(e) => Err(e)
-    }
+    let mut compressed = Vec::with_capacity(file.len());
+    let start_time = Instant::now();
+
+    zopfli::compress(options, Gzip, &file[..], &mut compressed)?;
+
+    let elapsed = start_time.elapsed();
+    compressed.shrink_to_fit();
+
+    let original_size = file.len();
+    let compressed_size = compressed.len();
+    let saved_space = original_size - compressed_size;
+
+
+    info!(%iterations, ?elapsed, %original_size, %compressed_size, %saved_space);
+
+    Ok(())
 }
+
